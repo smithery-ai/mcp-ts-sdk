@@ -1,0 +1,300 @@
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+const express_1 = __importDefault(require("express"));
+const node_crypto_1 = require("node:crypto");
+const mcp_js_1 = require("../../server/mcp.js");
+const streamableHttp_js_1 = require("../../server/streamableHttp.js");
+const zod_1 = require("zod");
+// Create a simple in-memory EventStore for resumability
+class InMemoryEventStore {
+    constructor() {
+        this.events = new Map();
+    }
+    /**
+     * Generates a unique event ID for a given stream ID
+     */
+    generateEventId(streamId) {
+        return `${streamId}_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
+    }
+    getStreamIdFromEventId(eventId) {
+        const parts = eventId.split('_');
+        return parts.length > 0 ? parts[0] : '';
+    }
+    /**
+     * Stores an event with a generated event ID
+     * Implements EventStore.storeEvent
+     */
+    async storeEvent(streamId, message) {
+        const eventId = this.generateEventId(streamId);
+        console.log(`Storing event ${eventId} for stream ${streamId}`);
+        this.events.set(eventId, { streamId, message });
+        return eventId;
+    }
+    /**
+     * Replays events that occurred after a specific event ID
+     * Implements EventStore.replayEventsAfter
+     */
+    async replayEventsAfter(lastEventId, { send }) {
+        if (!lastEventId || !this.events.has(lastEventId)) {
+            console.log(`No events found for lastEventId: ${lastEventId}`);
+            return '';
+        }
+        // Extract the stream ID from the event ID
+        const streamId = this.getStreamIdFromEventId(lastEventId);
+        if (!streamId) {
+            console.log(`Could not extract streamId from lastEventId: ${lastEventId}`);
+            return '';
+        }
+        let foundLastEvent = false;
+        let eventCount = 0;
+        // Sort events by eventId for chronological ordering
+        const sortedEvents = [...this.events.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+        for (const [eventId, { streamId: eventStreamId, message }] of sortedEvents) {
+            // Only include events from the same stream
+            if (eventStreamId !== streamId) {
+                continue;
+            }
+            // Start sending events after we find the lastEventId
+            if (eventId === lastEventId) {
+                foundLastEvent = true;
+                continue;
+            }
+            if (foundLastEvent) {
+                await send(eventId, message);
+                eventCount++;
+            }
+        }
+        console.log(`Replayed ${eventCount} events after ${lastEventId} for stream ${streamId}`);
+        return streamId;
+    }
+}
+// Create an MCP server with implementation details
+const server = new mcp_js_1.McpServer({
+    name: 'simple-streamable-http-server',
+    version: '1.0.0',
+}, { capabilities: { logging: {} } });
+// Register a simple tool that returns a greeting
+server.tool('greet', 'A simple greeting tool', {
+    name: zod_1.z.string().describe('Name to greet'),
+}, async ({ name }) => {
+    return {
+        content: [
+            {
+                type: 'text',
+                text: `Hello, ${name}!`,
+            },
+        ],
+    };
+});
+// Register a tool that sends multiple greetings with notifications
+server.tool('multi-greet', 'A tool that sends different greetings with delays between them', {
+    name: zod_1.z.string().describe('Name to greet'),
+}, async ({ name }, { sendNotification }) => {
+    const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+    await sendNotification({
+        method: "notifications/message",
+        params: { level: "debug", data: `Starting multi-greet for ${name}` }
+    });
+    await sleep(1000); // Wait 1 second before first greeting
+    await sendNotification({
+        method: "notifications/message",
+        params: { level: "info", data: `Sending first greeting to ${name}` }
+    });
+    await sleep(1000); // Wait another second before second greeting
+    await sendNotification({
+        method: "notifications/message",
+        params: { level: "info", data: `Sending second greeting to ${name}` }
+    });
+    return {
+        content: [
+            {
+                type: 'text',
+                text: `Good morning, ${name}!`,
+            }
+        ],
+    };
+});
+// Register a simple prompt
+server.prompt('greeting-template', 'A simple greeting prompt template', {
+    name: zod_1.z.string().describe('Name to include in greeting'),
+}, async ({ name }) => {
+    return {
+        messages: [
+            {
+                role: 'user',
+                content: {
+                    type: 'text',
+                    text: `Please greet ${name} in a friendly manner.`,
+                },
+            },
+        ],
+    };
+});
+// Register a tool specifically for testing resumability
+server.tool('start-notification-stream', 'Starts sending periodic notifications for testing resumability', {
+    interval: zod_1.z.number().describe('Interval in milliseconds between notifications').default(100),
+    count: zod_1.z.number().describe('Number of notifications to send (0 for 100)').default(50),
+}, async ({ interval, count }, { sendNotification }) => {
+    const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+    let counter = 0;
+    while (count === 0 || counter < count) {
+        counter++;
+        try {
+            await sendNotification({
+                method: "notifications/message",
+                params: {
+                    level: "info",
+                    data: `Periodic notification #${counter} at ${new Date().toISOString()}`
+                }
+            });
+        }
+        catch (error) {
+            console.error("Error sending notification:", error);
+        }
+        // Wait for the specified interval
+        await sleep(interval);
+    }
+    return {
+        content: [
+            {
+                type: 'text',
+                text: `Started sending periodic notifications every ${interval}ms`,
+            }
+        ],
+    };
+});
+// Create a simple resource at a fixed URI
+server.resource('greeting-resource', 'https://example.com/greetings/default', { mimeType: 'text/plain' }, async () => {
+    return {
+        contents: [
+            {
+                uri: 'https://example.com/greetings/default',
+                text: 'Hello, world!',
+            },
+        ],
+    };
+});
+const app = (0, express_1.default)();
+app.use(express_1.default.json());
+// Map to store transports by session ID
+const transports = {};
+app.post('/mcp', async (req, res) => {
+    console.log('Received MCP request:', req.body);
+    try {
+        // Check for existing session ID
+        const sessionId = req.headers['mcp-session-id'];
+        let transport;
+        if (sessionId && transports[sessionId]) {
+            // Reuse existing transport
+            transport = transports[sessionId];
+        }
+        else if (!sessionId && isInitializeRequest(req.body)) {
+            // New initialization request
+            const eventStore = new InMemoryEventStore();
+            transport = new streamableHttp_js_1.StreamableHTTPServerTransport({
+                sessionIdGenerator: () => (0, node_crypto_1.randomUUID)(),
+                eventStore, // Enable resumability
+            });
+            // Connect the transport to the MCP server BEFORE handling the request
+            // so responses can flow back through the same transport
+            await server.connect(transport);
+            // After handling the request, if we get a session ID back, store the transport
+            await transport.handleRequest(req, res, req.body);
+            // Store the transport by session ID for future requests
+            if (transport.sessionId) {
+                transports[transport.sessionId] = transport;
+            }
+            return; // Already handled
+        }
+        else {
+            // Invalid request - no session ID or not initialization request
+            res.status(400).json({
+                jsonrpc: '2.0',
+                error: {
+                    code: -32000,
+                    message: 'Bad Request: No valid session ID provided',
+                },
+                id: null,
+            });
+            return;
+        }
+        // Handle the request with existing transport - no need to reconnect
+        // The existing transport is already connected to the server
+        await transport.handleRequest(req, res, req.body);
+    }
+    catch (error) {
+        console.error('Error handling MCP request:', error);
+        if (!res.headersSent) {
+            res.status(500).json({
+                jsonrpc: '2.0',
+                error: {
+                    code: -32603,
+                    message: 'Internal server error',
+                },
+                id: null,
+            });
+        }
+    }
+});
+// Handle GET requests for SSE streams (using built-in support from StreamableHTTP)
+app.get('/mcp', async (req, res) => {
+    const sessionId = req.headers['mcp-session-id'];
+    if (!sessionId || !transports[sessionId]) {
+        res.status(400).send('Invalid or missing session ID');
+        return;
+    }
+    // Check for Last-Event-ID header for resumability
+    const lastEventId = req.headers['last-event-id'];
+    if (lastEventId) {
+        console.log(`Client reconnecting with Last-Event-ID: ${lastEventId}`);
+    }
+    else {
+        console.log(`Establishing new SSE stream for session ${sessionId}`);
+    }
+    const transport = transports[sessionId];
+    await transport.handleRequest(req, res);
+});
+// Helper function to detect initialize requests
+function isInitializeRequest(body) {
+    if (Array.isArray(body)) {
+        return body.some(msg => typeof msg === 'object' && msg !== null && 'method' in msg && msg.method === 'initialize');
+    }
+    return typeof body === 'object' && body !== null && 'method' in body && body.method === 'initialize';
+}
+// Start the server
+const PORT = 3000;
+app.listen(PORT, () => {
+    console.log(`MCP Streamable HTTP Server listening on port ${PORT}`);
+    console.log(`Initialize session with the command below id you are using curl for testing: 
+    -----------------------------
+    SESSION_ID=$(curl -X POST \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json" \
+    -H "Accept: text/event-stream" \
+    -d '{
+      "jsonrpc": "2.0",
+      "method": "initialize",
+      "params": {
+        "capabilities": {},
+        "protocolVersion": "2025-03-26", 
+        "clientInfo": {
+          "name": "test",
+          "version": "1.0.0"
+        }
+      },
+      "id": "1"
+    }' \
+    -i http://localhost:3000/mcp 2>&1 | grep -i "mcp-session-id" | cut -d' ' -f2 | tr -d '\\r')
+    echo "Session ID: $SESSION_ID"
+    -----------------------------`);
+});
+// Handle server shutdown
+process.on('SIGINT', async () => {
+    console.log('Shutting down server...');
+    await server.close();
+    process.exit(0);
+});
+//# sourceMappingURL=simpleStreamableHttp.js.map
